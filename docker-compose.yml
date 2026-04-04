@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: langfuse
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  langfuse-server:
+    image: langfuse/langfuse:2
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/langfuse
+      NEXTAUTH_SECRET: your-secret-key-change-me
+      NEXTAUTH_URL: http://localhost:3000
+      SALT: your-salt-change-me
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
