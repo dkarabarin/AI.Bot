@@ -53,7 +53,7 @@
         ```bash
         python bot-local.py
         ```
-    - Веб-версия (новая!):
+    - Веб-версия :
         ```bash
         python -m uvicorn web.api:app --reload --host 0.0.0.0 --port 8000
         ```
