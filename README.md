@@ -85,6 +85,7 @@ thermodynamics-rag/
 │   │   └── index.html       # HTML интерфейс
 │   └── README.md            # Документация веб-версии
 ├── bot-local.py             # Основной скрипт ассистента
+├── bot.py                   # Cкрипт для высоза в tg боте
 ├── rag.py                   # Модуль RAG (поиск, эмбеддинги)
 ├── requirements.txt         # Зависимости
 ├── .env.example             # Шаблон переменных окружения
