@@ -18,8 +18,9 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
-# Tavily для веб-поиска
+# Web Search
 from tavily import TavilyClient
+from ddgs import DDGS  # DuckDuckGo Search как fallback
 
 # Langfuse для наблюдаемости
 from langfuse import Langfuse
@@ -98,37 +99,121 @@ else:
     print("⚠️ Langfuse отключен")
 
 # ============================================================================
-# Веб-поиск через Tavily
+# Гибридный веб-поиск (Tavily с fallback на DuckDuckGo)
 # ============================================================================
 
-class TavilySearch:
-    def __init__(self, api_key: str):
-        self.client = TavilyClient(api_key=api_key) if api_key else None
-        self._available = self.client is not None
-
-    def search(self, query: str, max_results: int = 3) -> Optional[str]:
-        if not self._available:
-            return None
+class HybridWebSearch:
+    """Гибридный поиск: Tavily как основной, DuckDuckGo как fallback"""
+    
+    def __init__(self, tavily_api_key: Optional[str] = None):
+        self.tavily_client = None
+        self.tavily_available = False
+        self.ddg_available = False
+        self.active_search = None
+        
+        # Инициализация Tavily
+        if tavily_api_key:
+            try:
+                self.tavily_client = TavilyClient(api_key=tavily_api_key)
+                # Проверяем работу Tavily
+                test_response = self.tavily_client.search("test", max_results=1)
+                self.tavily_available = True
+                self.active_search = "tavily"
+                print("✅ Tavily поиск доступен (основной)")
+            except Exception as e:
+                print(f"⚠️ Tavily недоступен: {e}")
+        
+        # Инициализация DuckDuckGo как fallback
         try:
-            response = self.client.search(
-                query, search_depth="basic",
-                include_answer=False, max_results=max_results,
+            with DDGS() as ddgs:
+                test = list(ddgs.text("test", max_results=1))
+            self.ddg_available = True
+            if not self.tavily_available:
+                self.active_search = "duckduckgo"
+                print("✅ DuckDuckGo поиск доступен (fallback)")
+            else:
+                print("📌 DuckDuckGo доступен как резервный")
+        except Exception as e:
+            print(f"⚠️ DuckDuckGo недоступен: {e}")
+        
+        if not self.tavily_available and not self.ddg_available:
+            print("❌ Веб-поиск полностью недоступен!")
+    
+    def search(self, query: str, max_results: int = 3) -> Optional[str]:
+        """Выполняет поиск, автоматически выбирая доступный источник"""
+        
+        # Сначала пробуем Tavily
+        if self.tavily_available:
+            result = self._search_tavily(query, max_results)
+            if result:
+                return result
+        
+        # Если Tavily не сработал, пробуем DuckDuckGo
+        if self.ddg_available:
+            result = self._search_duckduckgo(query, max_results)
+            if result:
+                return result
+        
+        return None
+    
+    def _search_tavily(self, query: str, max_results: int = 3) -> Optional[str]:
+        """Поиск через Tavily"""
+        try:
+            response = self.tavily_client.search(
+                query, 
+                search_depth="basic",
+                include_answer=False, 
+                max_results=max_results,
             )
             results = response.get("results", [])
             if not results:
                 return None
+            
             formatted = []
             for r in results[:max_results]:
                 title = r.get("title", "Без названия")
                 content = r.get("content", "")
-                formatted.append(f"📄 **{title}**\n{content[:500]}")
+                url = r.get("url", "")
+                formatted.append(f"📄 **{title}**\n{content[:500]}\n🔗 {url}")
+            
             return "\n\n---\n\n".join(formatted)
         except Exception as e:
             logger.error(f"Ошибка Tavily: {e}")
             return None
-
+    
+    def _search_duckduckgo(self, query: str, max_results: int = 3) -> Optional[str]:
+        """Поиск через DuckDuckGo"""
+        try:
+            with DDGS() as ddgs:
+                results = list(ddgs.text(query, max_results=max_results))
+            
+            if not results:
+                return None
+            
+            formatted = []
+            for r in results[:max_results]:
+                title = r.get("title", "Без названия")
+                body = r.get("body", "")
+                href = r.get("href", "")
+                formatted.append(f"📄 **{title}**\n{body[:500]}\n🔗 {href}")
+            
+            return "\n\n---\n\n".join(formatted)
+        except Exception as e:
+            logger.error(f"Ошибка DuckDuckGo: {e}")
+            return None
+    
     def is_available(self) -> bool:
-        return self._available
+        """Проверяет доступность хотя бы одного поискового сервиса"""
+        return self.tavily_available or self.ddg_available
+    
+    def get_active_source(self) -> str:
+        """Возвращает активный источник поиска"""
+        if self.tavily_available:
+            return "Tavily"
+        elif self.ddg_available:
+            return "DuckDuckGo"
+        else:
+            return "None"
 
 # ============================================================================
 # Инициализация
@@ -142,9 +227,12 @@ llm = ChatOpenAI(
     max_tokens=2048,
 )
 
-tavily = TavilySearch(TAVILY_API_KEY)
+web_search = HybridWebSearch(TAVILY_API_KEY)
 knowledge_base = ThermodynamicsKnowledgeBase(BOOKS_DIR)
 knowledge_base.load()
+
+# Для обратной совместимости с api.py
+tavily = web_search  # Переименовываем для совместимости
 
 # ============================================================================
 # Функции ответов
@@ -175,16 +263,18 @@ def answer_from_pdf(question: str, trace_id: str = None) -> Optional[str]:
 
 @observe()
 def answer_from_web(question: str, trace_id: str = None) -> Optional[str]:
-    if not tavily.is_available():
+    if not web_search.is_available():
         return None
     
-    search_results = tavily.search(question, max_results=3)
+    search_results = web_search.search(question, max_results=3)
     if not search_results:
         return None
     
+    source_name = web_search.get_active_source()
+    
     messages = [
         SystemMessage(content=SYSTEM_PROMPT),
-        SystemMessage(content=f"\n\n--- ВЕБ-ПОИСК (Tavily) ---\n{search_results}"),
+        SystemMessage(content=f"\n\n--- ВЕБ-ПОИСК ({source_name}) ---\n{search_results}"),
         HumanMessage(content=question),
     ]
     
@@ -227,12 +317,13 @@ def get_answer(question: str, session_id: str = None) -> Tuple[str, str]:
         return answer, "📚 PDF"
     
     # Пробуем веб-поиск
-    print("  🌐 Поиск в интернете...")
+    source_name = web_search.get_active_source()
+    print(f"  🌐 Поиск в интернете ({source_name})...")
     answer = answer_from_web(question)
     if answer:
         if LANGFUSE_ENABLED:
             langfuse_context.score_current_trace(name="source", value=0.8)
-        return answer, "🌐 Интернет"
+        return answer, f"🌐 {source_name}"
     
     # Используем LLM
     print("  🤖 Использование LLM...")
@@ -242,21 +333,33 @@ def get_answer(question: str, session_id: str = None) -> Tuple[str, str]:
     return answer, "🎓 LLM"
 
 # ============================================================================
-# Консольный интерфейс (оставлен для обратной совместимости)
+# Консольный интерфейс
 # ============================================================================
 
 def main():
-    print("Запуск консольного интерфейса...")
+    print("\n" + "="*50)
+    print("🔧 Термодинамический консультант")
+    print("="*50)
+    print(f"📚 PDF база: {'загружена' if knowledge_base.vectorstore else 'не загружена'}")
+    print(f"🌐 Веб-поиск: {web_search.get_active_source()}")
+    print(f"🤖 LLM модель: {OLLAMA_MODEL}")
+    print("="*50 + "\n")
+    
     while True:
         try:
-            question = input("\n❓ Вопрос: ").strip()
-            if question.lower() in ['/quit', '/exit']:
+            question = input("\n❓ Вопрос (или /quit для выхода): ").strip()
+            if question.lower() in ['/quit', '/exit', '/q']:
                 break
             if question:
                 answer, source = get_answer(question)
                 print(f"\n{source} ОТВЕТ:\n{answer}\n")
+                print("-"*50)
         except KeyboardInterrupt:
             break
+        except EOFError:
+            break
+    
+    print("\n👋 До свидания!")
 
 if __name__ == "__main__":
     main()

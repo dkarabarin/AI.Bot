@@ -178,9 +178,12 @@ def health():
 @app.get("/api/stats")
 def get_stats():
     web_available = False
+    web_source = "None"
     if hasattr(tavily, 'is_available'):
         try:
             web_available = tavily.is_available()
+            if hasattr(tavily, 'get_active_source'):
+                web_source = tavily.get_active_source()
         except:
             pass
     
@@ -191,6 +194,7 @@ def get_stats():
     return {
         "knowledge_base_loaded": kb_loaded,
         "web_search_available": web_available,
+        "web_search_source": web_source,
         "langfuse_enabled": LANGFUSE_ENABLED,
         "ollama_model": OLLAMA_MODEL,
         "ollama_available": check_ollama(),
