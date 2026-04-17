@@ -1,5 +1,6 @@
 """
 Локальная RAG система для работы с PDF-документами по термодинамике
+С поддержкой стриминга (постепенной печати)
 """
 
 import os
@@ -7,10 +8,11 @@ import sys
 import logging
 import warnings
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional, Tuple, AsyncGenerator
 import time
-from datetime import datetime
 import re
+import asyncio
+import json
 
 from dotenv import load_dotenv
 
@@ -18,18 +20,23 @@ from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 
-# Web Search
-from tavily import TavilyClient
-from ddgs import DDGS  # DuckDuckGo Search как fallback
+# Tavily для веб-поиска
+try:
+    from tavily import TavilyClient
+    TAVILY_AVAILABLE = True
+except ImportError:
+    TAVILY_AVAILABLE = False
 
-# Langfuse для наблюдаемости
-from langfuse import Langfuse
-from langfuse.decorators import observe, langfuse_context
+# DuckDuckGo поиск
+try:
+    from duckduckgo_search import DDGS
+    DDGS_AVAILABLE = True
+except ImportError:
+    DDGS_AVAILABLE = False
 
 # Наш RAG модуль
 from rag import ThermodynamicsKnowledgeBase
 
-# Отключаем предупреждения
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -41,179 +48,108 @@ load_dotenv()
 # ============================================================================
 
 BOOKS_DIR = Path("./books")
-
-# Ollama (локальная модель)
 OLLAMA_BASE = os.getenv("OLLAMA_BASE", "http://localhost:11434/v1")
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3:4b")
-
-# Tavily
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
-
-# Langfuse
-LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY")
-LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY")
-LANGFUSE_HOST = os.getenv("LANGFUSE_HOST", "http://localhost:3000")
-LANGFUSE_ENABLED = False
-
-# Параметры RAG
 K_RETRIEVAL = 5
-MAX_HISTORY = 10
+SEARCH_MAX_RESULTS = 3
 
 # ============================================================================
-# УЛУЧШЕННЫЙ СИСТЕМНЫЙ ПРОМПТ
+# СИСТЕМНЫЙ ПРОМПТ
 # ============================================================================
 
-SYSTEM_PROMPT = """Ты — преподаватель по технической термодинамике.
+SYSTEM_PROMPT = """Ты — преподаватель по технической термодинамике (ТТД) и тепломассообмену (ТМО).
 
-ВАЖНЫЕ ПРАВИЛА ФОРМАТИРОВАНИЯ:
-1. Все формулы ОБЯЗАТЕЛЬНО заключай в $$...$$ для отдельных формул или $...$ для формул в тексте
-2. Пример: "Формула теплопроводности: $$k = \\frac{Q \\cdot \\ln(r_2/r_1)}{2\\pi L \\Delta T}$$"
-3. Пример в тексте: "Коэффициент $k$ измеряется в Вт/(м·К)"
-4. Используй \\frac{}{} для дробей, \\cdot для умножения
-5. Греческие буквы: \\alpha, \\beta, \\gamma, \\Delta, \\pi
+ОБЛАСТЬ ЗНАНИЙ:
+- Техническая термодинамика (ТТД): циклы, процессы, законы термодинамики
+- Тепломассообмен (ТМО): теплопроводность, конвекция, излучение, массообмен
 
-Пример правильной формулы:
-$$\\Delta S = \\int \\frac{dQ}{T}$$
+ПРИОРИТЕТ ИСТОЧНИКОВ:
+1. В ПЕРВУЮ ОЧЕРЕДЬ используй материал из PDF-документов в папке books/
+2. Если информации недостаточно — используй веб-поиск
+3. Не придумывай факты. Если ответа нет — честно скажи об этом
 
-Для лабораторных работ давай пошаговые инструкции с явными формулами.
+ПРАВИЛА ФОРМАТИРОВАНИЯ ФОРМУЛ:
+1. Все формулы ОБЯЗАТЕЛЬНО заключай в $$...$$ для отдельных формул
+2. Для формул в тексте используй $...$
+3. Используй \\frac{}{} для дробей, \\cdot для умножения
+4. Греческие буквы: \\alpha, \\beta, \\gamma, \\Delta, \\pi
+
+Пример: "Первый закон термодинамики: $$\\Delta U = Q - A$$"
+
+Отвечай на русском языке. Будь полезным и точным.
 """
 
 # ============================================================================
-# Инициализация Langfuse
+# ВЕБ-ПОИСК
 # ============================================================================
 
-langfuse = None
-if LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY:
-    try:
-        langfuse = Langfuse(
-            public_key=LANGFUSE_PUBLIC_KEY,
-            secret_key=LANGFUSE_SECRET_KEY,
-            host=LANGFUSE_HOST,
-        )
-        langfuse.auth_check()
-        LANGFUSE_ENABLED = True
-        print("✅ Langfuse инициализирован")
-    except Exception as e:
-        print(f"⚠️ Langfuse не инициализирован: {e}")
-else:
-    print("⚠️ Langfuse отключен")
-
-# ============================================================================
-# Гибридный веб-поиск (Tavily с fallback на DuckDuckGo)
-# ============================================================================
-
-class HybridWebSearch:
-    """Гибридный поиск: Tavily как основной, DuckDuckGo как fallback"""
-    
-    def __init__(self, tavily_api_key: Optional[str] = None):
-        self.tavily_client = None
-        self.tavily_available = False
-        self.ddg_available = False
-        self.active_search = None
+class WebSearch:
+    def __init__(self, api_key: Optional[str] = None):
+        self.use_tavily = False
+        self.use_duckduckgo = False
         
-        # Инициализация Tavily
-        if tavily_api_key:
+        if api_key and TAVILY_AVAILABLE:
             try:
-                self.tavily_client = TavilyClient(api_key=tavily_api_key)
-                # Проверяем работу Tavily
-                test_response = self.tavily_client.search("test", max_results=1)
-                self.tavily_available = True
-                self.active_search = "tavily"
-                print("✅ Tavily поиск доступен (основной)")
-            except Exception as e:
-                print(f"⚠️ Tavily недоступен: {e}")
+                self.tavily_client = TavilyClient(api_key=api_key)
+                self.use_tavily = True
+                logger.info("✅ Веб-поиск: Tavily")
+            except:
+                pass
         
-        # Инициализация DuckDuckGo как fallback
-        try:
-            with DDGS() as ddgs:
-                test = list(ddgs.text("test", max_results=1))
-            self.ddg_available = True
-            if not self.tavily_available:
-                self.active_search = "duckduckgo"
-                print("✅ DuckDuckGo поиск доступен (fallback)")
-            else:
-                print("📌 DuckDuckGo доступен как резервный")
-        except Exception as e:
-            print(f"⚠️ DuckDuckGo недоступен: {e}")
-        
-        if not self.tavily_available and not self.ddg_available:
-            print("❌ Веб-поиск полностью недоступен!")
+        if not self.use_tavily and DDGS_AVAILABLE:
+            self.use_duckduckgo = True
+            logger.info("✅ Веб-поиск: DuckDuckGo")
     
     def search(self, query: str, max_results: int = 3) -> Optional[str]:
-        """Выполняет поиск, автоматически выбирая доступный источник"""
-        
-        # Сначала пробуем Tavily
-        if self.tavily_available:
-            result = self._search_tavily(query, max_results)
-            if result:
-                return result
-        
-        # Если Tavily не сработал, пробуем DuckDuckGo
-        if self.ddg_available:
-            result = self._search_duckduckgo(query, max_results)
-            if result:
-                return result
-        
+        if self.use_tavily:
+            return self._search_tavily(query, max_results)
+        elif self.use_duckduckgo:
+            return self._search_duckduckgo(query, max_results)
         return None
     
-    def _search_tavily(self, query: str, max_results: int = 3) -> Optional[str]:
-        """Поиск через Tavily"""
+    def _search_tavily(self, query: str, max_results: int) -> Optional[str]:
         try:
-            response = self.tavily_client.search(
-                query, 
-                search_depth="basic",
-                include_answer=False, 
-                max_results=max_results,
-            )
+            response = self.tavily_client.search(query, search_depth="basic", max_results=max_results)
             results = response.get("results", [])
             if not results:
                 return None
-            
             formatted = []
             for r in results[:max_results]:
-                title = r.get("title", "Без названия")
+                title = r.get("title", "")
                 content = r.get("content", "")
-                url = r.get("url", "")
-                formatted.append(f"📄 **{title}**\n{content[:500]}\n🔗 {url}")
-            
+                formatted.append(f"**{title}**\n{content[:500]}")
             return "\n\n---\n\n".join(formatted)
         except Exception as e:
-            logger.error(f"Ошибка Tavily: {e}")
+            logger.error(f"Tavily error: {e}")
             return None
     
-    def _search_duckduckgo(self, query: str, max_results: int = 3) -> Optional[str]:
-        """Поиск через DuckDuckGo"""
+    def _search_duckduckgo(self, query: str, max_results: int) -> Optional[str]:
         try:
             with DDGS() as ddgs:
                 results = list(ddgs.text(query, max_results=max_results))
-            
-            if not results:
-                return None
-            
-            formatted = []
-            for r in results[:max_results]:
-                title = r.get("title", "Без названия")
-                body = r.get("body", "")
-                href = r.get("href", "")
-                formatted.append(f"📄 **{title}**\n{body[:500]}\n🔗 {href}")
-            
-            return "\n\n---\n\n".join(formatted)
+                if not results:
+                    return None
+                formatted = []
+                for r in results[:max_results]:
+                    title = r.get('title', '')
+                    body = r.get('body', '')
+                    body = re.sub(r'\s+', ' ', body).strip()
+                    formatted.append(f"**{title}**\n{body[:500]}")
+                return "\n\n---\n\n".join(formatted)
         except Exception as e:
-            logger.error(f"Ошибка DuckDuckGo: {e}")
+            logger.error(f"DuckDuckGo error: {e}")
             return None
     
     def is_available(self) -> bool:
-        """Проверяет доступность хотя бы одного поискового сервиса"""
-        return self.tavily_available or self.ddg_available
+        return self.use_tavily or self.use_duckduckgo
     
-    def get_active_source(self) -> str:
-        """Возвращает активный источник поиска"""
-        if self.tavily_available:
+    def get_engine_name(self) -> str:
+        if self.use_tavily:
             return "Tavily"
-        elif self.ddg_available:
+        elif self.use_duckduckgo:
             return "DuckDuckGo"
-        else:
-            return "None"
+        return "Недоступен"
 
 # ============================================================================
 # Инициализация
@@ -227,19 +163,15 @@ llm = ChatOpenAI(
     max_tokens=2048,
 )
 
-web_search = HybridWebSearch(TAVILY_API_KEY)
+web_search = WebSearch(TAVILY_API_KEY)
 knowledge_base = ThermodynamicsKnowledgeBase(BOOKS_DIR)
 knowledge_base.load()
-
-# Для обратной совместимости с api.py
-tavily = web_search  # Переименовываем для совместимости
 
 # ============================================================================
 # Функции ответов
 # ============================================================================
 
-@observe()
-def answer_from_pdf(question: str, trace_id: str = None) -> Optional[str]:
+def answer_from_pdf(question: str) -> Optional[str]:
     if not knowledge_base.vectorstore:
         return None
     
@@ -250,7 +182,7 @@ def answer_from_pdf(question: str, trace_id: str = None) -> Optional[str]:
     context = "\n\n---\n\n".join(context_chunks)
     messages = [
         SystemMessage(content=SYSTEM_PROMPT),
-        SystemMessage(content=f"\n\n--- ИЗ PDF-ДОКУМЕНТОВ ---\n{context}"),
+        SystemMessage(content=f"Используй информацию из PDF:\n{context}"),
         HumanMessage(content=question),
     ]
     
@@ -258,23 +190,20 @@ def answer_from_pdf(question: str, trace_id: str = None) -> Optional[str]:
         response = llm.invoke(messages)
         return response.content
     except Exception as e:
-        logger.error(f"Ошибка RAG: {e}")
+        logger.error(f"RAG error: {e}")
         return None
 
-@observe()
-def answer_from_web(question: str, trace_id: str = None) -> Optional[str]:
+def answer_from_web(question: str) -> Optional[str]:
     if not web_search.is_available():
         return None
     
-    search_results = web_search.search(question, max_results=3)
+    search_results = web_search.search(question)
     if not search_results:
         return None
     
-    source_name = web_search.get_active_source()
-    
     messages = [
         SystemMessage(content=SYSTEM_PROMPT),
-        SystemMessage(content=f"\n\n--- ВЕБ-ПОИСК ({source_name}) ---\n{search_results}"),
+        SystemMessage(content=f"Результаты поиска:\n{search_results}"),
         HumanMessage(content=question),
     ]
     
@@ -282,84 +211,167 @@ def answer_from_web(question: str, trace_id: str = None) -> Optional[str]:
         response = llm.invoke(messages)
         return response.content
     except Exception as e:
-        logger.error(f"Ошибка веб-ответа: {e}")
+        logger.error(f"Web error: {e}")
         return None
 
-@observe()
-def answer_direct(question: str, trace_id: str = None) -> str:
-    messages = [
-        SystemMessage(content=SYSTEM_PROMPT),
-        HumanMessage(content=question),
-    ]
-    
+def answer_direct(question: str) -> str:
+    messages = [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=question)]
     try:
         response = llm.invoke(messages)
         return response.content
     except Exception as e:
-        logger.error(f"Ошибка LLM: {e}")
         return f"Ошибка: {e}"
 
-@observe()
+def is_educational_query(question: str) -> bool:
+    """Проверка на образовательный запрос"""
+    educational_keywords = [
+        "термодинамик", "тепломассообмен", "энтропи", "энтальпи",
+        "формула", "расчет", "закон", "цикл", "кпд", "нуссельт",
+        "лабораторн", "экзамен", "помоги", "объясни", "расскажи",
+        "thermodynamics", "heat transfer", "entropy", "enthalpy",
+        "nusselt", "reynolds", "prandtl", "fourier"
+    ]
+    question_lower = question.lower()
+    return any(kw in question_lower for kw in educational_keywords)
+
 def get_answer(question: str, session_id: str = None) -> Tuple[str, str]:
-    if LANGFUSE_ENABLED:
-        langfuse_context.update_current_trace(
-            name="question_answer",
-            user_id=session_id or "web_user",
-            session_id=session_id or datetime.now().strftime("%Y%m%d_%H%M%S"),
-        )
+    """Получает ответ с указанием источника (без стриминга)"""
     
-    # Пробуем PDF
-    print("  🔍 Поиск в PDF...")
+    # Проверка на образовательный запрос
+    if not is_educational_query(question) and len(question) > 15:
+        return """📚 Я специализируюсь на вопросах по **технической термодинамике (ТТД)** и **тепломассообмену (ТМО)**.
+
+**Примеры вопросов:**
+• Объясни первый закон термодинамики
+• Что такое число Нуссельта?
+• Как рассчитать КПД цикла Карно?
+• Напиши формулу теплопроводности
+
+Задайте конкретный вопрос по этим темам!""", "🎓 Совет"
+    
+    print(f"  🔍 Поиск в PDF: {question[:50]}...")
     answer = answer_from_pdf(question)
     if answer:
-        if LANGFUSE_ENABLED:
-            langfuse_context.score_current_trace(name="source", value=1.0)
+        print("  ✅ Найдено в PDF")
         return answer, "📚 PDF"
     
-    # Пробуем веб-поиск
-    source_name = web_search.get_active_source()
-    print(f"  🌐 Поиск в интернете ({source_name})...")
-    answer = answer_from_web(question)
-    if answer:
-        if LANGFUSE_ENABLED:
-            langfuse_context.score_current_trace(name="source", value=0.8)
-        return answer, f"🌐 {source_name}"
+    if web_search.is_available():
+        print(f"  🌐 Поиск в интернете ({web_search.get_engine_name()})...")
+        answer = answer_from_web(question)
+        if answer:
+            print(f"  ✅ Найдено через {web_search.get_engine_name()}")
+            return answer, f"🌐 {web_search.get_engine_name()}"
     
-    # Используем LLM
     print("  🤖 Использование LLM...")
     answer = answer_direct(question)
-    if LANGFUSE_ENABLED:
-        langfuse_context.score_current_trace(name="source", value=0.6)
     return answer, "🎓 LLM"
 
+
 # ============================================================================
-# Консольный интерфейс
+# СТРИМИНГ (постепенная печать)
 # ============================================================================
 
-def main():
-    print("\n" + "="*50)
-    print("🔧 Термодинамический консультант")
-    print("="*50)
-    print(f"📚 PDF база: {'загружена' if knowledge_base.vectorstore else 'не загружена'}")
-    print(f"🌐 Веб-поиск: {web_search.get_active_source()}")
-    print(f"🤖 LLM модель: {OLLAMA_MODEL}")
-    print("="*50 + "\n")
+async def get_answer_stream(question: str, session_id: str = None) -> AsyncGenerator[str, None]:
+    """
+    Стриминг ответа с постепенной печатью.
+    Отправляет JSON строки с полями: chunk, source, done
+    """
     
-    while True:
-        try:
-            question = input("\n❓ Вопрос (или /quit для выхода): ").strip()
-            if question.lower() in ['/quit', '/exit', '/q']:
-                break
-            if question:
-                answer, source = get_answer(question)
-                print(f"\n{source} ОТВЕТ:\n{answer}\n")
-                print("-"*50)
-        except KeyboardInterrupt:
-            break
-        except EOFError:
-            break
+    # Проверка на образовательный запрос
+    if not is_educational_query(question) and len(question) > 15:
+        yield json.dumps({
+            "chunk": "📚 Я специализируюсь на вопросах по **технической термодинамике (ТТД)** и **тепломассообмену (ТМО)**.\n\n**Примеры вопросов:**\n• Объясни первый закон термодинамики\n• Что такое число Нуссельта?\n• Как рассчитать КПД цикла Карно?\n• Напиши формулу теплопроводности\n\nЗадайте конкретный вопрос по этим темам!",
+            "source": "🎓 Совет",
+            "done": True
+        }) + "\n"
+        return
     
-    print("\n👋 До свидания!")
+    # Пробуем получить ответ из PDF
+    print(f"  🔍 Поиск в PDF: {question[:50]}...")
+    answer = answer_from_pdf(question)
+    source = "📚 PDF"
+    
+    if not answer and web_search.is_available():
+        print(f"  🌐 Поиск в интернете ({web_search.get_engine_name()})...")
+        answer = answer_from_web(question)
+        source = f"🌐 {web_search.get_engine_name()}"
+    
+    if not answer:
+        print("  🤖 Использование LLM...")
+        answer = answer_direct(question)
+        source = "🎓 LLM"
+    
+    # Разбиваем ответ на части для постепенной печати
+    # По словам или по символам для плавного эффекта
+    words = answer.split()
+    total_words = len(words)
+    
+    # Отправляем источник первым чанком
+    yield json.dumps({
+        "chunk": "",
+        "source": source,
+        "done": False
+    }) + "\n"
+    
+    # Стримим по 2-3 слова за раз
+    for i in range(0, total_words, 3):
+        chunk = ' '.join(words[i:i+3])
+        if chunk:
+            yield json.dumps({
+                "chunk": chunk + " ",
+                "source": None,
+                "done": False
+            }) + "\n"
+        await asyncio.sleep(0.03)  # Небольшая задержка для эффекта печати
+    
+    # Финальный сигнал
+    yield json.dumps({
+        "chunk": "",
+        "source": source,
+        "done": True
+    }) + "\n"
+    
+    print(f"  ✅ Стриминг завершен ({total_words} слов)")
+
+
+# ============================================================================
+# Запуск
+# ============================================================================
 
 if __name__ == "__main__":
-    main()
+    print("\n" + "="*60)
+    print("🔥 ИИ-преподаватель по ТТД и ТМО")
+    print("="*60)
+    
+    stats = knowledge_base.get_stats()
+    print(f"📚 RAG: {'✅' if stats.get('loaded') else '❌'} ({stats.get('vectors', 0)} векторов)")
+    print(f"🌐 Поиск: {web_search.get_engine_name()}")
+    print(f"🤖 Модель: {OLLAMA_MODEL}")
+    print(f"✨ Стриминг: включен (постепенная печать)")
+    print("="*60)
+    print("Введите вопрос или 'quit' для выхода\n")
+    
+    async def async_main():
+        while True:
+            try:
+                question = input("❓ Вопрос: ").strip()
+                if question.lower() in ['quit', 'exit']:
+                    break
+                if not question:
+                    continue
+                
+                print("  ⏳ Думаю...")
+                start = time.time()
+                
+                # Для консоли используем обычный режим (без стриминга)
+                answer, source = get_answer(question)
+                elapsed = time.time() - start
+                
+                print(f"\n{source} ({elapsed:.1f}с):")
+                print(answer)
+                print("-"*60)
+            except KeyboardInterrupt:
+                break
+    
+    asyncio.run(async_main())
+    print("\n👋 До свидания!")

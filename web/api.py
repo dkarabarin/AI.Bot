@@ -1,5 +1,5 @@
 """
-FastAPI-сервер для веб-интерфейса термодинамического бота.
+FastAPI-сервер для веб-интерфейса ИИ преподавателя по ТТД и ТМО
 """
 
 from __future__ import annotations
@@ -7,157 +7,130 @@ from __future__ import annotations
 import logging
 import sys
 import time
-import re
+import asyncio
+import json
 from pathlib import Path
 from datetime import datetime
 from contextlib import asynccontextmanager
+from typing import AsyncGenerator
 
-# Добавляем корень проекта в sys.path
-ROOT_DIR = Path(__file__).resolve().parents[1]
+ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT_DIR))
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from pydantic import BaseModel, Field
+
+from guardrails_light import guardrails
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Пытаемся импортировать модули бота
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Загрузка бота
+# ============================================================================
 
-# Переменные с значениями по умолчанию
 get_answer = None
-tavily = None
+get_answer_stream = None
+web_search = None
 knowledge_base = None
-LANGFUSE_ENABLED = False
-langfuse = None
 OLLAMA_MODEL = "qwen3:4b"
-OLLAMA_BASE = "http://localhost:11434/v1"
 
-# Пробуем импортировать из bot-local.py
 bot_local_path = ROOT_DIR / "bot-local.py"
 
 if bot_local_path.exists():
     try:
-        with open(bot_local_path, 'r', encoding='utf-8') as f:
-            code = f.read()
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("bot_local", bot_local_path)
+        bot_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(bot_module)
         
-        namespace = {}
-        exec(code, namespace)
+        get_answer = getattr(bot_module, 'get_answer', None)
+        get_answer_stream = getattr(bot_module, 'get_answer_stream', None)
+        web_search = getattr(bot_module, 'web_search', None)
+        knowledge_base = getattr(bot_module, 'knowledge_base', None)
+        OLLAMA_MODEL = getattr(bot_module, 'OLLAMA_MODEL', 'qwen3:4b')
         
-        get_answer = namespace.get('get_answer')
-        tavily = namespace.get('tavily')
-        knowledge_base = namespace.get('knowledge_base')
-        LANGFUSE_ENABLED = namespace.get('LANGFUSE_ENABLED', False)
-        langfuse = namespace.get('langfuse')
-        OLLAMA_MODEL = namespace.get('OLLAMA_MODEL', 'qwen3:4b')
-        OLLAMA_BASE = namespace.get('OLLAMA_BASE', 'http://localhost:11434/v1')
-        
-        logger.info("✅ Успешно загружен bot-local.py")
-        
+        logger.info("✅ Загружен bot-local.py")
     except Exception as e:
-        logger.error(f"❌ Ошибка загрузки bot-local.py: {e}")
-else:
-    logger.warning(f"⚠️ Файл bot-local.py не найден в {ROOT_DIR}")
+        logger.error(f"Ошибка загрузки: {e}")
 
 if get_answer is None:
-    logger.warning("⚠️ Используется заглушка для get_answer")
     def get_answer(question, session_id=None):
-        return f"🤖 Тестовый ответ на: {question}", "⚠️ Тестовый режим"
+        return f"📚 **Вопрос:** {question}\n\n**Ответ:** Это тестовый режим. Для работы установите Ollama.", "⚠️ Тест"
 
-if tavily is None:
-    class TavilyStub:
-        def is_available(self): return False
-    tavily = TavilyStub()
+if get_answer_stream is None:
+    async def get_answer_stream(question: str, session_id: str = None) -> AsyncGenerator[str, None]:
+        answer, source = get_answer(question, session_id)
+        words = answer.split()
+        for i in range(0, len(words), 3):
+            chunk = ' '.join(words[i:i+3])
+            yield json.dumps({"chunk": chunk + " ", "source": source if i == 0 else None, "done": False}) + "\n"
+            await asyncio.sleep(0.03)
+        yield json.dumps({"chunk": "", "source": source, "done": True}) + "\n"
 
-# ---------------------------------------------------------------------------
-# Pydantic-модели
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Модели
+# ============================================================================
 
 class ChatRequest(BaseModel):
-    message: str = Field(..., min_length=1, max_length=2000)
-    session_id: str = Field(..., min_length=1, max_length=100)
+    message: str
+    session_id: str
+    stream: bool = True
 
 class ChatResponse(BaseModel):
     reply: str
     session_id: str
-    source: str = "🤖 LLM"
-    processing_time: float = 0.0
+    source: str
+    processing_time: float
 
 class ClearRequest(BaseModel):
     session_id: str
 
-# ---------------------------------------------------------------------------
-# Хранилище сессий
-# ---------------------------------------------------------------------------
+# ============================================================================
+# Хранилище
+# ============================================================================
 
 class SessionStore:
     def __init__(self):
         self.sessions = {}
         self.history = {}
     
-    def get_or_create_session(self, session_id: str):
+    def get_or_create(self, session_id: str):
         if session_id not in self.sessions:
-            self.sessions[session_id] = {
-                "created_at": datetime.now(),
-                "message_count": 0,
-                "last_active": datetime.now()
-            }
+            self.sessions[session_id] = {"created": datetime.now(), "count": 0}
             self.history[session_id] = []
         return self.sessions[session_id]
     
     def add_message(self, session_id: str, role: str, content: str, source: str = None):
         if session_id not in self.history:
             self.history[session_id] = []
-        
-        message = {
-            "role": role,
-            "content": content,
-            "timestamp": datetime.now().isoformat(),
-            "source": source if role == "assistant" else None
-        }
-        self.history[session_id].append(message)
-        
+        self.history[session_id].append({
+            "role": role, "content": content, "time": datetime.now().isoformat(), "source": source
+        })
         if session_id in self.sessions:
-            self.sessions[session_id]["message_count"] += 1
-            self.sessions[session_id]["last_active"] = datetime.now()
+            self.sessions[session_id]["count"] += 1
     
-    def get_history(self, session_id: str, limit: int = 50):
-        if session_id not in self.history:
-            return []
-        return self.history[session_id][-limit:]
-    
-    def clear_history(self, session_id: str):
+    def clear(self, session_id: str):
         if session_id in self.history:
             self.history[session_id] = []
         if session_id in self.sessions:
-            self.sessions[session_id]["message_count"] = 0
+            self.sessions[session_id]["count"] = 0
 
-session_store = SessionStore()
+store = SessionStore()
 
-# ---------------------------------------------------------------------------
-# FastAPI приложение
-# ---------------------------------------------------------------------------
+# ============================================================================
+# FastAPI
+# ============================================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("🚀 Запуск веб-сервера")
-    logger.info(f"🤖 Модель: {OLLAMA_MODEL}")
-    
-    try:
-        if hasattr(tavily, 'is_available'):
-            logger.info(f"🌐 Веб-поиск: {'доступен' if tavily.is_available() else 'недоступен'}")
-    except:
-        pass
-    
+    logger.info("🚀 Запуск сервера")
     yield
-    logger.info("👋 Остановка сервера")
+    logger.info("👋 Остановка")
 
-app = FastAPI(title="Термодинамический Консультант", lifespan=lifespan)
+app = FastAPI(title="ИИ преподаватель по ТТД и ТМО", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -167,48 +140,51 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------------------------
-# API Эндпоинты
-# ---------------------------------------------------------------------------
+# ============================================================================
+# API
+# ============================================================================
 
 @app.get("/api/health")
 def health():
-    return {"status": "ok", "timestamp": datetime.now().isoformat()}
+    return {"status": "ok", "time": datetime.now().isoformat()}
 
 @app.get("/api/stats")
-def get_stats():
-    web_available = False
-    web_source = "None"
-    if hasattr(tavily, 'is_available'):
-        try:
-            web_available = tavily.is_available()
-            if hasattr(tavily, 'get_active_source'):
-                web_source = tavily.get_active_source()
-        except:
-            pass
-    
-    kb_loaded = False
-    if knowledge_base and hasattr(knowledge_base, '_loaded'):
-        kb_loaded = knowledge_base._loaded
+def stats():
+    kb_loaded = knowledge_base and hasattr(knowledge_base, '_loaded') and knowledge_base._loaded
+    web_avail = web_search and hasattr(web_search, 'is_available') and web_search.is_available()
     
     return {
         "knowledge_base_loaded": kb_loaded,
-        "web_search_available": web_available,
-        "web_search_source": web_source,
-        "langfuse_enabled": LANGFUSE_ENABLED,
+        "web_search_available": web_avail,
+        "web_search_engine": web_search.get_engine_name() if web_search else "Нет",
         "ollama_model": OLLAMA_MODEL,
-        "ollama_available": check_ollama(),
-        "total_sessions": len(session_store.sessions)
+        "ollama_available": True,
+        "total_sessions": len(store.sessions),
+        "guardrails": guardrails.get_status(),
+        "streaming_supported": True
     }
 
-@app.post("/api/chat", response_model=ChatResponse)
-def chat(req: ChatRequest):
-    logger.info(f"📨 Запрос: {req.message[:50]}...")
+@app.post("/api/chat")
+async def chat(req: ChatRequest):
+    """Обычный endpoint без стриминга (для тестирования и обратной совместимости)"""
+    logger.info(f"Обычный запрос: {req.message[:50]}...")
     
-    session_store.get_or_create_session(req.session_id)
-    session_store.add_message(req.session_id, "user", req.message)
+    # Проверка безопасности
+    is_safe, error_msg, details = guardrails.check(req.message, req.session_id)
     
-    start_time = time.time()
+    if not is_safe:
+        logger.warning(f"Блокировка: {details.get('category')}")
+        return ChatResponse(
+            reply=error_msg,
+            session_id=req.session_id,
+            source="🛡️ Guardrails",
+            processing_time=0.0
+        )
+    
+    store.get_or_create(req.session_id)
+    store.add_message(req.session_id, "user", req.message)
+    
+    start = time.time()
     
     try:
         result = get_answer(req.message, session_id=req.session_id)
@@ -219,85 +195,90 @@ def chat(req: ChatRequest):
             answer = result
             source = "🤖 Бот"
         
-        # Обработка формул: заменяем \ на \\ для JSON
-        # Но оставляем как есть для отображения
+        elapsed = time.time() - start
         
-        processing_time = time.time() - start_time
-        
-        session_store.add_message(req.session_id, "assistant", answer, source)
-        
-        logger.info(f"✅ Ответ за {processing_time:.2f}с")
+        store.add_message(req.session_id, "assistant", answer, source)
         
         return ChatResponse(
             reply=answer,
             session_id=req.session_id,
             source=source,
-            processing_time=processing_time
+            processing_time=elapsed
         )
-    except Exception as exc:
-        logger.exception("❌ Ошибка")
-        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception as e:
+        logger.exception("Ошибка")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/chat/stream")
+async def chat_stream(req: ChatRequest):
+    """Endpoint с поддержкой стриминга"""
+    logger.info(f"Stream запрос: {req.message[:50]}...")
+    
+    # Проверка безопасности
+    is_safe, error_msg, details = guardrails.check(req.message, req.session_id)
+    
+    if not is_safe:
+        async def error_stream():
+            yield json.dumps({"chunk": error_msg, "source": "🛡️ Guardrails", "done": True}) + "\n"
+        return StreamingResponse(error_stream(), media_type="application/x-ndjson")
+    
+    store.get_or_create(req.session_id)
+    store.add_message(req.session_id, "user", req.message)
+    
+    async def generate():
+        full_answer = ""
+        source = None
+        
+        try:
+            async for chunk_data in get_answer_stream(req.message, session_id=req.session_id):
+                if isinstance(chunk_data, str):
+                    try:
+                        data = json.loads(chunk_data)
+                        chunk = data.get("chunk", "")
+                        source = data.get("source", source)
+                        is_done = data.get("done", False)
+                    except:
+                        chunk = chunk_data
+                        is_done = False
+                else:
+                    chunk = chunk_data.get("chunk", "")
+                    source = chunk_data.get("source", source)
+                    is_done = chunk_data.get("done", False)
+                
+                full_answer += chunk
+                yield json.dumps({"chunk": chunk, "source": source, "done": is_done}) + "\n"
+                
+                if is_done:
+                    store.add_message(req.session_id, "assistant", full_answer, source)
+                    
+        except Exception as e:
+            logger.exception(f"Stream ошибка: {e}")
+            yield json.dumps({"chunk": f"\n\n❌ Ошибка: {str(e)}", "source": "⚠️ Ошибка", "done": True}) + "\n"
+    
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
 
 @app.post("/api/clear")
-def clear_history(req: ClearRequest):
-    logger.info(f"🧹 Очистка истории: {req.session_id}")
-    session_store.clear_history(req.session_id)
+def clear(req: ClearRequest):
+    store.clear(req.session_id)
     return {"status": "ok"}
 
-@app.get("/api/history")
-def get_history(session_id: str, limit: int = 50):
-    return {
-        "session_id": session_id,
-        "messages": session_store.get_history(session_id, limit),
-        "count": len(session_store.get_history(session_id, limit))
-    }
 
-def check_ollama() -> bool:
-    try:
-        import requests
-        response = requests.get(f"{OLLAMA_BASE}/models", timeout=3)
-        return response.status_code == 200
-    except:
-        return False
+# ============================================================================
+# HTML
+# ============================================================================
 
-# ---------------------------------------------------------------------------
-# HTML интерфейс с поддержкой формул
-# ---------------------------------------------------------------------------
-
-SIMPLE_HTML = r"""
-<!DOCTYPE html>
+HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Термодинамический Консультант</title>
-    
-    <!-- MathJax для рендеринга формул -->
-    <script>
-        window.MathJax = {
-            tex: {
-                inlineMath: [['$', '$'], ['\\(', '\\)']],
-                displayMath: [['$$', '$$'], ['\\[', '\\]']],
-                processEscapes: true,
-                packages: {'[+]': ['unicode']}
-            },
-            options: {
-                skipHtmlTags: ['script', 'noscript', 'style', 'textarea', 'pre']
-            },
-            startup: {
-                pageReady: () => {
-                    return MathJax.startup.defaultPageReady();
-                }
-            }
-        };
-    </script>
-    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
-    
+    <title>ИИ преподаватель по ТТД и ТМО</title>
+    <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-chtml.js"></script>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
             min-height: 100vh;
             padding: 20px;
         }
@@ -306,122 +287,95 @@ SIMPLE_HTML = r"""
             margin: 0 auto;
             background: white;
             border-radius: 20px;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            box-shadow: 0 20px 40px rgba(0,0,0,0.2);
             overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            height: 90vh;
         }
         .header {
-            background: linear-gradient(135deg, #2c3e50, #1a1a2e);
+            background: linear-gradient(135deg, #1a1a2e, #0f3460);
             color: white;
-            padding: 20px;
+            padding: 15px 20px;
             display: flex;
             justify-content: space-between;
             align-items: center;
             flex-wrap: wrap;
             gap: 10px;
         }
-        .header h1 { font-size: 1.3rem; display: flex; align-items: center; gap: 10px; }
-        .status { display: flex; gap: 10px; flex-wrap: wrap; }
+        .header h1 { font-size: 1.2rem; }
+        .status { display: flex; gap: 8px; flex-wrap: wrap; }
         .badge {
             background: rgba(255,255,255,0.2);
-            padding: 5px 12px;
+            padding: 4px 10px;
             border-radius: 20px;
-            font-size: 0.8rem;
+            font-size: 0.75rem;
         }
+        .clear-btn {
+            background: rgba(255,255,255,0.2);
+            margin-left: 8px;
+            cursor: pointer;
+        }
+        .clear-btn:hover { background: rgba(255,255,255,0.3); }
         .chat {
-            height: 500px;
+            flex: 1;
             overflow-y: auto;
             padding: 20px;
-            background: #f5f6fa;
+            background: #f0f2f5;
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
         }
         .message {
-            margin-bottom: 20px;
             display: flex;
             gap: 10px;
-            animation: fadeIn 0.3s ease;
-        }
-        @keyframes fadeIn {
-            from { opacity: 0; transform: translateY(10px); }
-            to { opacity: 1; transform: translateY(0); }
         }
         .message.user { justify-content: flex-end; }
-        .message-avatar {
-            width: 40px;
-            height: 40px;
+        .avatar {
+            width: 36px;
+            height: 36px;
             border-radius: 50%;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 1.2rem;
+            font-size: 1.1rem;
             flex-shrink: 0;
         }
-        .message.user .message-avatar { background: #ff6b35; }
-        .message.bot .message-avatar { background: #2c3e50; }
-        .message-content {
-            max-width: 70%;
+        .message.user .avatar { background: #e94560; }
+        .message.bot .avatar { background: #0f3460; }
+        .bubble {
+            max-width: 75%;
             padding: 12px 16px;
             border-radius: 18px;
             background: white;
             box-shadow: 0 1px 2px rgba(0,0,0,0.1);
         }
-        .message.user .message-content {
-            background: #ff6b35;
+        .message.user .bubble {
+            background: #e94560;
             color: white;
         }
-        .message-text {
-            line-height: 1.6;
-            word-wrap: break-word;
-        }
-        .message-text p {
-            margin-bottom: 10px;
-        }
-        .message-text p:last-child {
-            margin-bottom: 0;
-        }
-        .message-text ul, .message-text ol {
-            margin: 10px 0;
-            padding-left: 25px;
-        }
-        .message-text li {
-            margin: 5px 0;
-        }
-        .message-text pre {
-            background: #2d2d2d;
-            color: #f8f8f2;
-            padding: 10px;
-            border-radius: 8px;
-            overflow-x: auto;
-            margin: 10px 0;
-            font-family: 'Courier New', monospace;
-            font-size: 0.9em;
-        }
-        .message-text code {
-            background: #f0f0f0;
-            padding: 2px 6px;
-            border-radius: 4px;
-            font-family: 'Courier New', monospace;
-            font-size: 0.9em;
-        }
-        .message.user .message-text code {
-            background: rgba(255,255,255,0.2);
-            color: white;
-        }
-        /* Стили для формул */
-        .message-text mjx-container {
-            margin: 12px 0;
-            overflow-x: auto;
-            overflow-y: hidden;
-            padding: 8px 0;
-        }
-        .message-source {
+        .bubble-text { line-height: 1.5; }
+        .bubble-text p { margin-bottom: 8px; }
+        .bubble-source {
             font-size: 0.7rem;
-            margin-top: 8px;
+            margin-top: 6px;
             opacity: 0.7;
-            display: flex;
-            align-items: center;
-            gap: 8px;
+        }
+        .cursor-blink {
+            display: inline-block;
+            width: 2px;
+            height: 1.2em;
+            background-color: #e94560;
+            margin-left: 2px;
+            animation: blink 1s step-end infinite;
+            vertical-align: middle;
+        }
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0; }
         }
         .input-area {
-            padding: 20px;
+            padding: 15px 20px;
             background: white;
             border-top: 1px solid #e1e8ed;
             display: flex;
@@ -429,315 +383,346 @@ SIMPLE_HTML = r"""
         }
         textarea {
             flex: 1;
-            padding: 12px 16px;
+            padding: 10px 15px;
             border: 2px solid #e1e8ed;
             border-radius: 25px;
             resize: none;
             font-family: inherit;
-            font-size: 1rem;
-            transition: all 0.3s;
+            font-size: 0.95rem;
+            outline: none;
         }
-        textarea:focus { outline: none; border-color: #ff6b35; }
+        textarea:focus { border-color: #e94560; }
         button {
-            background: #ff6b35;
+            background: #e94560;
             color: white;
             border: none;
-            padding: 12px 24px;
+            padding: 10px 20px;
             border-radius: 25px;
             cursor: pointer;
-            font-size: 1rem;
-            transition: all 0.3s;
+            font-size: 0.95rem;
         }
-        button:hover:not(:disabled) { background: #e55a2b; transform: translateY(-2px); }
+        button:hover { background: #c73e56; }
         button:disabled { opacity: 0.6; cursor: not-allowed; }
         .typing {
+            padding: 10px 15px;
+            background: white;
+            border-radius: 18px;
+            width: fit-content;
+            display: flex;
+            gap: 8px;
             color: #666;
             font-style: italic;
-            padding: 10px;
-            display: flex;
-            align-items: center;
-            gap: 10px;
         }
-        .typing-dots {
-            display: flex;
-            gap: 4px;
-        }
-        .typing-dots span {
-            width: 8px;
-            height: 8px;
-            background: #7f8c8d;
+        .dot {
+            width: 6px;
+            height: 6px;
+            background: #666;
             border-radius: 50%;
-            animation: typing 1.4s infinite;
+            animation: bounce 1.4s infinite;
         }
-        .typing-dots span:nth-child(2) { animation-delay: 0.2s; }
-        .typing-dots span:nth-child(3) { animation-delay: 0.4s; }
-        @keyframes typing {
+        .dot:nth-child(2) { animation-delay: 0.2s; }
+        .dot:nth-child(3) { animation-delay: 0.4s; }
+        @keyframes bounce {
             0%, 60%, 100% { transform: translateY(0); }
-            30% { transform: translateY(-10px); }
+            30% { transform: translateY(-8px); }
         }
-        .clear-btn {
-            background: rgba(255,255,255,0.2);
-            margin-left: 10px;
-        }
-        .clear-btn:hover { background: rgba(255,255,255,0.3); transform: none; }
-        
         @media (max-width: 768px) {
-            .message-content { max-width: 85%; }
+            .bubble { max-width: 85%; }
             .header h1 { font-size: 1rem; }
-            .badge span:last-child { display: none; }
         }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>
-                <span>🔥</span>
-                <span>Термодинамический Консультант</span>
-            </h1>
-            <div class="status">
-                <div class="badge" id="kb-status">📚 RAG</div>
-                <div class="badge" id="web-status">🌐 Поиск</div>
-                <div class="badge" id="model-status">🤖 Модель</div>
-                <button class="clear-btn" onclick="clearChat()">🗑️ Очистить</button>
-            </div>
-        </div>
-        <div class="chat" id="chat"></div>
-        <div class="input-area">
-            <textarea id="message" placeholder="Введите вопрос по термодинамике..." rows="2"></textarea>
-            <button id="sendBtn" onclick="sendMessage()">📤 Отправить</button>
+<div class="container">
+    <div class="header">
+        <h1>🔥 ИИ преподаватель по ТТД и ТМО</h1>
+        <div class="status">
+            <div class="badge" id="badge-kb">📚 RAG</div>
+            <div class="badge" id="badge-web">🌐 Поиск</div>
+            <div class="badge" id="badge-guard">🛡️ Guardrails</div>
+            <div class="badge clear-btn" id="btn-clear">🗑️ Очистить</div>
         </div>
     </div>
+    <div class="chat" id="chat"></div>
+    <div class="input-area">
+        <textarea id="input" placeholder="Введите вопрос по термодинамике..." rows="1"></textarea>
+        <button id="btn-send">📤 Отправить</button>
+    </div>
+</div>
 
-    <script>
-        let sessionId = null;
-        let isWaiting = false;
+<script>
+(function() {
+    let sessionId = localStorage.getItem("session_id");
+    if (!sessionId) {
+        sessionId = crypto.randomUUID();
+        localStorage.setItem("session_id", sessionId);
+    }
+    
+    let isLoading = false;
+    let fullAnswer = "";
+    
+    const chat = document.getElementById("chat");
+    const input = document.getElementById("input");
+    const sendBtn = document.getElementById("btn-send");
+    const clearBtn = document.getElementById("btn-clear");
+    const badgeKb = document.getElementById("badge-kb");
+    const badgeWeb = document.getElementById("badge-web");
+    const badgeGuard = document.getElementById("badge-guard");
+    
+    function formatText(text) {
+        if (!text) return "";
+        let result = text;
+        result = result.replace(/&/g, "&amp;");
+        result = result.replace(/</g, "&lt;");
+        result = result.replace(/>/g, "&gt;");
+        result = result.replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
+        result = result.replace(/\n/g, "<br>");
+        return result;
+    }
+    
+    function addUserMessage(content) {
+        const div = document.createElement("div");
+        div.className = "message user";
         
-        // Функция для исправления LaTeX формул
-        function fixLatex(content) {
-            if (!content) return content;
-            
-            // Заменяем \ln на \ln (оставляем как есть)
-            // Заменяем \frac на \frac (оставляем как есть)
-            // Убираем лишние экранирования
-            content = content.replace(/\\\\/g, '\\');
-            
-            return content;
+        const avatar = document.createElement("div");
+        avatar.className = "avatar";
+        avatar.textContent = "👤";
+        
+        const bubble = document.createElement("div");
+        bubble.className = "bubble";
+        
+        const textDiv = document.createElement("div");
+        textDiv.className = "bubble-text";
+        textDiv.innerHTML = formatText(content);
+        bubble.appendChild(textDiv);
+        
+        div.appendChild(avatar);
+        div.appendChild(bubble);
+        chat.appendChild(div);
+        chat.scrollTop = chat.scrollHeight;
+    }
+    
+    function createStreamingMessage() {
+        const div = document.createElement("div");
+        div.className = "message bot";
+        div.id = "streaming-message";
+        
+        const avatar = document.createElement("div");
+        avatar.className = "avatar";
+        avatar.textContent = "🤖";
+        
+        const bubble = document.createElement("div");
+        bubble.className = "bubble";
+        
+        const textDiv = document.createElement("div");
+        textDiv.className = "bubble-text";
+        
+        const contentSpan = document.createElement("span");
+        contentSpan.id = "streaming-content";
+        const cursorSpan = document.createElement("span");
+        cursorSpan.className = "cursor-blink";
+        
+        textDiv.appendChild(contentSpan);
+        textDiv.appendChild(cursorSpan);
+        bubble.appendChild(textDiv);
+        
+        const sourceDiv = document.createElement("div");
+        sourceDiv.className = "bubble-source";
+        sourceDiv.id = "streaming-source";
+        bubble.appendChild(sourceDiv);
+        
+        div.appendChild(avatar);
+        div.appendChild(bubble);
+        chat.appendChild(div);
+        chat.scrollTop = chat.scrollHeight;
+        
+        return { contentSpan, sourceDiv, cursorSpan };
+    }
+    
+    function updateStreaming(content, source, isDone) {
+        const contentSpan = document.getElementById("streaming-content");
+        const sourceDiv = document.getElementById("streaming-source");
+        const cursorSpan = document.querySelector(".cursor-blink");
+        
+        if (contentSpan) {
+            contentSpan.innerHTML = formatText(content);
+        }
+        if (sourceDiv && source) {
+            sourceDiv.textContent = source;
+        }
+        if (isDone && cursorSpan) {
+            cursorSpan.style.display = "none";
         }
         
-        // Функция для рендеринга формул
-        async function renderFormulas(element) {
-            if (window.MathJax) {
-                try {
-                    await MathJax.typesetPromise([element]);
-                    console.log('Formulas rendered');
-                } catch (err) {
-                    console.log('MathJax error:', err);
-                }
-            }
+        if (window.MathJax && contentSpan) {
+            MathJax.typesetPromise([contentSpan]).catch(console.error);
         }
         
-        document.addEventListener('DOMContentLoaded', function() {
-            console.log('Page loaded');
-            
-            sessionId = localStorage.getItem('session_id');
-            if (!sessionId) {
-                sessionId = crypto.randomUUID();
-                localStorage.setItem('session_id', sessionId);
-            }
-            
-            loadStats();
-            setInterval(loadStats, 30000);
-            
-            setTimeout(async () => {
-                await addMessage('bot', '👋 **Здравствуйте!** Я консультант по технической термодинамике.\n\nЗадайте мне вопрос!');
-            }, 500);
-            
-            document.getElementById('message').focus();
-        });
+        chat.scrollTop = chat.scrollHeight;
+    }
+    
+    function showLoading() {
+        const div = document.createElement("div");
+        div.id = "loading";
+        div.className = "typing";
+        div.innerHTML = '<div style="display:flex;gap:4px"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div><span>🤖 Преподаватель печатает...</span>';
+        chat.appendChild(div);
+        chat.scrollTop = chat.scrollHeight;
+    }
+    
+    function hideLoading() {
+        const el = document.getElementById("loading");
+        if (el) el.remove();
+    }
+    
+    async function sendMessage() {
+        const message = input.value.trim();
+        if (!message || isLoading) return;
         
-        async function sendMessage() {
-            const input = document.getElementById('message');
-            const message = input.value.trim();
-            
-            if (!message || isWaiting) return;
-            
-            input.value = '';
-            input.style.height = 'auto';
-            
-            await addMessage('user', message);
-            
-            isWaiting = true;
-            const sendBtn = document.getElementById('sendBtn');
-            sendBtn.disabled = true;
-            showTyping();
-            
-            try {
-                const response = await fetch('/api/chat', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ message: message, session_id: sessionId })
-                });
-                
-                if (!response.ok) {
-                    throw new Error('Server error: ' + response.status);
-                }
-                
-                const data = await response.json();
-                hideTyping();
-                
-                let reply = data.reply;
-                await addMessage('bot', reply, data.source);
-                
-            } catch (error) {
-                console.error('Error:', error);
-                hideTyping();
-                await addMessage('bot', '❌ Error: ' + error.message);
-            } finally {
-                isWaiting = false;
-                sendBtn.disabled = false;
-                document.getElementById('message').focus();
-            }
-        }
+        input.value = "";
+        input.style.height = "auto";
         
-        async function addMessage(role, content, source = null) {
-            const chat = document.getElementById('chat');
-            const div = document.createElement('div');
-            div.className = 'message ' + role;
-            
-            const avatar = document.createElement('div');
-            avatar.className = 'message-avatar';
-            avatar.textContent = role === 'user' ? '👤' : '🤖';
-            
-            const contentDiv = document.createElement('div');
-            contentDiv.className = 'message-content';
-            
-            const textDiv = document.createElement('div');
-            textDiv.className = 'message-text';
-            
-            // Обработка текста и формул
-            let formattedContent = content || '';
-            
-            // Экранирование HTML
-            formattedContent = formattedContent
-                .replace(/&/g, '&amp;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;');
-            
-            // Markdown форматирование
-            formattedContent = formattedContent.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
-            formattedContent = formattedContent.replace(/\*(.*?)\*/g, '<em>$1</em>');
-            formattedContent = formattedContent.replace(/\n/g, '<br>');
-            
-            // Обработка списков
-            formattedContent = formattedContent.replace(/^[•\-] (.*?)$/gm, '<li>$1</li>');
-            formattedContent = formattedContent.replace(/(<li>.*?<\/li>)+/gs, function(match) {
-                if (!match.includes('<ul>')) {
-                    return '<ul>' + match + '</ul>';
-                }
-                return match;
+        addUserMessage(message);
+        
+        isLoading = true;
+        sendBtn.disabled = true;
+        showLoading();
+        
+        fullAnswer = "";
+        createStreamingMessage();
+        
+        try {
+            const response = await fetch("/api/chat/stream", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ message: message, session_id: sessionId, stream: true })
             });
             
-            textDiv.innerHTML = formattedContent;
-            contentDiv.appendChild(textDiv);
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = "";
             
-            if (source && role === 'bot') {
-                const sourceDiv = document.createElement('div');
-                sourceDiv.className = 'message-source';
-                sourceDiv.innerHTML = '📎 ' + source;
-                contentDiv.appendChild(sourceDiv);
-            }
-            
-            div.appendChild(avatar);
-            div.appendChild(contentDiv);
-            chat.appendChild(div);
-            
-            // Рендерим формулы
-            await renderFormulas(textDiv);
-            
-            chat.scrollTop = chat.scrollHeight;
-        }
-        
-        function showTyping() {
-            const chat = document.getElementById('chat');
-            const typingDiv = document.createElement('div');
-            typingDiv.id = 'typing-indicator';
-            typingDiv.className = 'typing';
-            typingDiv.innerHTML = '<div class="typing-dots"><span></span><span></span><span></span></div><span>🤖 Бот печатает...</span>';
-            chat.appendChild(typingDiv);
-            chat.scrollTop = chat.scrollHeight;
-        }
-        
-        function hideTyping() {
-            const typing = document.getElementById('typing-indicator');
-            if (typing) typing.remove();
-        }
-        
-        async function clearChat() {
-            if (!confirm('Очистить историю диалога?')) return;
-            try {
-                await fetch('/api/clear', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ session_id: sessionId })
-                });
-                document.getElementById('chat').innerHTML = '';
-                await addMessage('bot', '🧹 История очищена. Задайте новый вопрос!');
-            } catch(e) {
-                console.error('Clear error:', e);
-            }
-        }
-        
-        async function loadStats() {
-            try {
-                const response = await fetch('/api/stats');
-                if (!response.ok) return;
-                const stats = await response.json();
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
                 
-                const kbBadge = document.getElementById('kb-status');
-                const webBadge = document.getElementById('web-status');
-                const modelBadge = document.getElementById('model-status');
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split("\n");
+                buffer = lines.pop() || "";
                 
-                if (kbBadge) kbBadge.innerHTML = stats.knowledge_base_loaded ? '📚 RAG ✅' : '📚 RAG ❌';
-                if (webBadge) webBadge.innerHTML = stats.web_search_available ? '🌐 Поиск ✅' : '🌐 Поиск ❌';
-                if (modelBadge) modelBadge.innerHTML = stats.ollama_available ? '🤖 ' + stats.ollama_model + ' ✅' : '🤖 Модель ❌';
-            } catch(e) {
-                console.log('Stats error:', e);
-            }
-        }
-        
-        // Auto-resize textarea
-        const textarea = document.getElementById('message');
-        if (textarea) {
-            textarea.addEventListener('input', function() {
-                this.style.height = 'auto';
-                this.style.height = Math.min(this.scrollHeight, 150) + 'px';
-            });
-            
-            textarea.addEventListener('keydown', function(e) {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                    e.preventDefault();
-                    sendMessage();
+                for (const line of lines) {
+                    if (line.trim()) {
+                        try {
+                            const data = JSON.parse(line);
+                            if (data.chunk !== undefined) {
+                                fullAnswer += data.chunk;
+                                updateStreaming(fullAnswer, data.source, data.done);
+                            }
+                        } catch (e) {
+                            console.error("Parse error:", e);
+                        }
+                    }
                 }
-            });
+            }
+        } catch (error) {
+            console.error("Stream error:", error);
+            updateStreaming(fullAnswer + "\n\n❌ Ошибка: " + error.message, "⚠️ Ошибка", true);
+        } finally {
+            hideLoading();
+            isLoading = false;
+            sendBtn.disabled = false;
+            input.focus();
         }
+    }
+    
+    async function clearChat() {
+        if (!confirm("Очистить историю диалога?")) return;
+        try {
+            await fetch("/api/clear", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ session_id: sessionId })
+            });
+            chat.innerHTML = "";
+            addWelcomeMessage();
+        } catch (err) {
+            console.error("Clear error:", err);
+        }
+    }
+    
+    async function loadStats() {
+        try {
+            const res = await fetch("/api/stats");
+            if (!res.ok) return;
+            const stats = await res.json();
+            
+            if (badgeKb) {
+                badgeKb.innerHTML = stats.knowledge_base_loaded ? "📚 RAG ✅" : "📚 RAG ❌";
+            }
+            if (badgeWeb) {
+                const engine = stats.web_search_engine || "Поиск";
+                badgeWeb.innerHTML = stats.web_search_available ? "🌐 " + engine + " ✅" : "🌐 Поиск ❌";
+            }
+            if (badgeGuard) {
+                badgeGuard.innerHTML = stats.guardrails?.active ? "🛡️ Guardrails ✅" : "🛡️ Guardrails ⚠️";
+            }
+        } catch(e) {
+            console.log("Stats error:", e);
+        }
+    }
+    
+    function addWelcomeMessage() {
+        const div = document.createElement("div");
+        div.className = "message bot";
         
-        window.sendMessage = sendMessage;
-        window.clearChat = clearChat;
-    </script>
+        const avatar = document.createElement("div");
+        avatar.className = "avatar";
+        avatar.textContent = "🤖";
+        
+        const bubble = document.createElement("div");
+        bubble.className = "bubble";
+        
+        const textDiv = document.createElement("div");
+        textDiv.className = "bubble-text";
+        textDiv.innerHTML = "👋 Здравствуйте! Я ИИ-преподаватель по <strong>технической термодинамике (ТТД)</strong> и <strong>тепломассообмену (ТМО)</strong>.<br><br>Задайте мне вопрос по:<br>• 📚 Лабораторным работам<br>• 📊 Обработке данных<br>• 📖 Теоретическому материалу<br>• 🔬 Подготовке к экзаменам";
+        
+        bubble.appendChild(textDiv);
+        div.appendChild(avatar);
+        div.appendChild(bubble);
+        chat.appendChild(div);
+    }
+    
+    sendBtn.onclick = sendMessage;
+    clearBtn.onclick = clearChat;
+    
+    input.onkeydown = function(e) {
+        if (e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault();
+            sendMessage();
+        }
+    };
+    
+    input.oninput = function() {
+        this.style.height = "auto";
+        this.style.height = Math.min(this.scrollHeight, 120) + "px";
+    };
+    
+    loadStats();
+    setInterval(loadStats, 30000);
+    addWelcomeMessage();
+    input.focus();
+    
+    console.log("Chat initialized, sessionId:", sessionId);
+})();
+</script>
 </body>
 </html>
 """
 
 @app.get("/")
 async def root():
-    """Главная страница с чатом."""
-    return HTMLResponse(content=SIMPLE_HTML)
+    return HTMLResponse(content=HTML_PAGE)
 
-# ---------------------------------------------------------------------------
-# Статические файлы (опционально)
-# ---------------------------------------------------------------------------
-
-_STATIC_DIR = Path(__file__).resolve().parent / "static"
-if _STATIC_DIR.exists():
-    app.mount("/static", StaticFiles(directory=str(_STATIC_DIR)), name="static")
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
