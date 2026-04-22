@@ -69,7 +69,6 @@
 4. **Клонирование и установка**
     ```bash
     git clone <repository-url>
-    cd thermodynamics-rag
     python -m venv venv
     ```
     - Активация виртуальной среды:
